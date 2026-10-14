@@ -13,7 +13,7 @@ const sharedPara = `Before writing any code, run the full test suite and make su
 fs.writeFileSync(path.join(tmp, "package.json"), JSON.stringify({
   name: "fixture",
   scripts: { test: "node test.js", build: "node build.js" },
-  dependencies: { react: "^19.0.0" },
+  dependencies: { react: "^19.0.0", next: "^14.2.0" },
 }));
 fs.writeFileSync(path.join(tmp, "realfile.md"), "# exists\n");
 fs.writeFileSync(path.join(tmp, "CLAUDE.md"), `# rules
@@ -23,6 +23,8 @@ fs.writeFileSync(path.join(tmp, "CLAUDE.md"), `# rules
 - more at \`realfile.md\`
 - types come from \`@types/node\`
 - example layout: \`\`\`\nsrc/features/auth/login.ts\n\`\`\`
+- in the next 2 steps, run lint
+- after the fence, see \`config/missing.toml\`
 
 ${sharedPara}
 `);
@@ -37,10 +39,23 @@ fs.writeFileSync(path.join(tmp, "AGENTS.md"), `# rules
 
 ${sharedPara}
 `);
-// CRLF line endings + a dead ref, to prove line endings don't break parsing
-fs.writeFileSync(path.join(tmp, "CLAUDE.local.md"), "# local\r\n- see `notes/ghost-todo.md`\r\n");
-// symlink alias: same content must not count as a second file or a duplicate
-fs.symlinkSync("CLAUDE.md", path.join(tmp, "GEMINI.md"));
+// BOM + CRLF line endings + a dead ref: neither may break parsing
+fs.writeFileSync(path.join(tmp, "CLAUDE.local.md"), "\uFEFF# local\r\n- see `notes/ghost-todo.md`\r\n");
+// a .mdc rule: frontmatter says "never push" (must NOT trigger a polarity
+// conflict — frontmatter is metadata, not prose) and uses yaml list globs
+fs.mkdirSync(path.join(tmp, ".cursor", "rules"), { recursive: true });
+fs.writeFileSync(path.join(tmp, ".cursor", "rules", "scoped.mdc"), `---
+description: never push anything anywhere
+globs:
+  - gone-dir/**
+  - ../**
+---
+scoped rule body
+`);
+// symlink alias: same content must not count as a second file or a duplicate.
+// guarded: plain Windows users can't create symlinks (EPERM).
+let symlinkOk = true;
+try { fs.symlinkSync("CLAUDE.md", path.join(tmp, "GEMINI.md")); } catch { symlinkOk = false; }
 
 const out = execFileSync("node", [bin, tmp, "--json"], { encoding: "utf8" });
 const r = JSON.parse(out);
@@ -48,20 +63,26 @@ const r = JSON.parse(out);
 let fails = 0;
 const ok = (cond, msg) => { console.log((cond ? " PASS " : " FAIL ") + msg); if (!cond) fails++; };
 
-ok(r.files.length === 3, `found 3 files (symlink deduped, got ${r.files.length})`);
+ok(r.files.length === 4, `found 4 files (symlink deduped, got ${r.files.length})`);
 ok(r.findings.some(f => f.kind === "CONFLICT" && f.topic === "indentation"), "tabs-vs-spaces conflict");
 ok(r.findings.some(f => f.kind === "CONFLICT" && f.topic === "package manager"), "npm-vs-pnpm conflict");
-ok(r.findings.some(f => f.kind === "CONFLICT" && /push/.test(f.topic)), "push-to-main polarity conflict");
+ok(r.findings.filter(f => f.kind === "CONFLICT" && /push/.test(f.topic)).length === 1, "push-to-main polarity conflict (once, frontmatter not counted)");
 ok(r.findings.some(f => f.kind === "DEAD REF" && f.ref === "docs/ARCHITECTURE.md"), "dead ref docs/ARCHITECTURE.md");
 ok(!r.findings.some(f => f.kind === "DEAD REF" && /realfile/.test(f.ref)), "realfile.md not flagged");
 ok(!r.findings.some(f => f.kind === "DEAD REF" && /types\/node|types\/react/.test(f.ref)), "@types/* not flagged as dead ref");
 ok(!r.findings.some(f => f.kind === "DEAD REF" && /login\.ts/.test(f.ref)), "fenced example path not flagged");
-ok(r.findings.some(f => f.kind === "DEAD REF" && f.ref === "notes/ghost-todo.md"), "CRLF file dead ref still found");
+// dead ref after a multi-line fence must report its true line number (11)
+const toml = r.findings.find(f => f.kind === "DEAD REF" && f.ref === "config/missing.toml");
+ok(toml && toml.line === 11, `dead ref after fence at true line (got ${toml?.line})`);
+ok(r.findings.some(f => f.kind === "DEAD REF" && f.ref === "notes/ghost-todo.md"), "BOM+CRLF file dead ref still found");
 ok(r.findings.some(f => f.kind === "DEAD CMD" && f.cmd === "deploy"), "dead cmd npm run deploy");
 ok(!r.findings.some(f => f.kind === "DEAD CMD" && /^(build|install)$/.test(f.cmd)), "pnpm install / npm run build not flagged");
 ok(r.findings.some(f => f.kind === "DUPLICATE"), "duplicated paragraph across CLAUDE.md + AGENTS.md");
-ok(!r.findings.some(f => f.kind === "DUPLICATE" && f.files.some(p => /GEMINI/.test(p))), "symlink alias not counted as duplicate");
+if (symlinkOk) ok(!r.findings.some(f => f.kind === "DUPLICATE" && f.files.some(p => /GEMINI/.test(p))), "symlink alias not counted as duplicate");
 ok(r.findings.some(f => f.kind === "STALE" && /react/i.test(f.ref)), "stale react 17 vs installed 19");
+ok(!r.findings.some(f => f.kind === "STALE" && /next/i.test(f.ref)), "'the next 2 steps' not a stale Next.js version");
+ok(r.findings.some(f => f.kind === "DEAD GLOB" && /gone-dir/.test(f.ref)), "yaml list glob to missing dir flagged");
+ok(!r.findings.some(f => f.kind === "DEAD GLOB" && /^\.\./.test(f.ref)), "../ glob prefix resolves, not flagged");
 ok(r.score < 100 && r.score >= 0, `score penalized (${r.score}/100, grade ${r.grade})`);
 
 // clean repo -> grade A, no findings; one file that alone mentions both npm

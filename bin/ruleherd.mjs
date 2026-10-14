@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 const HOME = os.homedir();
 
 // ---------- discovery ----------
@@ -82,7 +82,7 @@ function discover(root) {
   const add = (p, label) => {
     try {
       const st = fs.statSync(p);
-      if (st.isFile() && st.size > 0) addFound(found, p, label, st.mtime);
+      if (st.isFile() && st.size > 0 && st.size < 5_000_000) addFound(found, p, label, st.mtime);
     } catch {}
   };
 
@@ -110,7 +110,7 @@ function discoverUser() {
   const add = (p, label) => {
     try {
       const st = fs.statSync(p);
-      if (st.isFile() && st.size > 0) addFound(found, p, label, st.mtime);
+      if (st.isFile() && st.size > 0 && st.size < 5_000_000) addFound(found, p, label, st.mtime);
     } catch {}
   };
   for (const { file, label } of USER_FILES) add(expandHome(file), label);
@@ -128,17 +128,21 @@ function discoverUser() {
 
 // repo-relative when inside root, ~/... when under HOME but outside root,
 // absolute otherwise.
+const toPosix = p => p.replaceAll("\\", "/");
 const rel = (root, p) => {
   const r = path.relative(root, p);
-  if (r && !r.startsWith(".." + path.sep) && r !== ".." && !path.isAbsolute(r)) return r;
+  if (r && !r.startsWith(".." + path.sep) && r !== ".." && !path.isAbsolute(r)) return toPosix(r);
   if (!r) return path.basename(p);
-  if (p.startsWith(HOME + path.sep)) return "~" + p.slice(HOME.length);
-  return p;
+  if (p.startsWith(HOME + path.sep)) return toPosix("~" + p.slice(HOME.length));
+  return toPosix(p);
 };
 
-// fenced code blocks hold examples, not rules. mask them (length-preserving,
-// keeps line numbers aligned) for checks that would flag examples as refs.
-const stripFences = t => t.replace(/```[\s\S]*?(?:```|$)/g, m => " ".repeat(m.length));
+// fenced code blocks + yaml frontmatter hold examples/metadata, not rules.
+// mask them (newline-preserving, keeps line numbers aligned) so checks don't
+// flag examples or frontmatter descriptions as refs or polarity statements.
+const maskNewlines = m => m.replace(/[^\n]/g, " ");
+const stripFences = t => t.replace(/```[\s\S]*?(?:```|$)/g, maskNewlines);
+const stripFrontmatter = t => t.replace(/^---\n[\s\S]*?(?:\n---\n?|$)/, maskNewlines);
 
 // contradiction topics: [name, regexA label, regexA, regexB label, regexB]
 const TOPIC_PAIRS = [
@@ -217,7 +221,7 @@ function normalizeBlock(t) {
 function checkDuplicates(files, root) {
   const seen = new Map(); // normalized block -> {files:Set, len}
   for (const f of files) {
-    const paras = f.text.split(/\n\s*\n/);
+    const paras = f.prose.split(/\n\s*\n/);
     for (const p of paras) {
       const n = normalizeBlock(p);
       if (n.length < 150) continue;
@@ -293,16 +297,26 @@ const PM_BUILTINS = new Set([
   "create", "publish", "cache", "config", "why", "list", "ls", "outdated",
   "update", "upgrade", "link", "unlink", "audit", "pack", "info", "help",
   "version", "run", "-r", "--recursive", "import", "rebuild", "prune",
+  "test", "t", "start", "stop", "restart", "ci", "env", "store", "patch",
+  "patch-commit", "dedupe", "find-dupes", "workspaces", "workspace", "bin",
+  "dir", "root", "doctor", "fetch", "licenses", "login", "logout",
+  "whoami", "setup", "pkg",
 ]);
 
-function collectScripts(root) {
-  const scripts = new Set();
+// walk once, hand the parsed package.jsons to every check that needs them.
+function collectPkgs(root) {
+  const pkgs = [];
   for (const f of walk(root, 0)) {
     if (path.basename(f) !== "package.json") continue;
-    try {
-      const s = JSON.parse(fs.readFileSync(f, "utf8")).scripts || {};
-      for (const k of Object.keys(s)) scripts.add(k);
-    } catch {}
+    try { pkgs.push(JSON.parse(fs.readFileSync(f, "utf8"))); } catch {}
+  }
+  return pkgs;
+}
+
+function collectScripts(pkgs) {
+  const scripts = new Set();
+  for (const pkg of pkgs) {
+    for (const k of Object.keys(pkg.scripts || {})) scripts.add(k);
   }
   return scripts;
 }
@@ -316,13 +330,13 @@ function checkDeadCmds(files, root, scripts) {
     f.prose.split("\n").forEach((line, i) => {
       for (const m of line.matchAll(explicit)) {
         if (!scripts.has(m[1])) {
-          findings.push({ kind: "DEAD CMD", cmd: m[1], file: rel(root, f.path), line: i + 1 });
+          findings.push({ kind: "DEAD CMD", cmd: m[1], raw: m[0].replaceAll("`", ""), file: rel(root, f.path), line: i + 1 });
         }
       }
       for (const m of line.matchAll(bare)) {
         // bare `pnpm x` runs script x, but builtin subcommands aren't scripts
         if (!PM_BUILTINS.has(m[1]) && !scripts.has(m[1])) {
-          findings.push({ kind: "DEAD CMD", cmd: m[1], file: rel(root, f.path), line: i + 1 });
+          findings.push({ kind: "DEAD CMD", cmd: m[1], raw: m[0].replaceAll("`", ""), file: rel(root, f.path), line: i + 1 });
         }
       }
     });
@@ -333,22 +347,25 @@ function checkDeadCmds(files, root, scripts) {
 // stale tech-version mentions: "react 17" in rules while package.json has ^19
 const VERSIONED = ["react", "next", "vue", "svelte", "angular", "tailwindcss", "typescript", "node", "prisma", "zod", "vite"];
 
-function checkStaleVersions(files, root) {
+// dependency specifiers that carry no parseable semver (git urls, workspace
+// links, catalogs) or that should not be read as version mentions.
+const NONSEMVER_DEP = /^(?:file|link|portal|catalog|workspace|npm:|git|github:|https?:)/i;
+// count nouns after a version-looking number ("the next 2 steps", "react 10
+// times") make it prose, not a version mention.
+const COUNT_NOUN = /^\s+(?:items?|steps?|lines?|files?|times?|days?|hours?|minutes|seconds|weeks?|months?|years?|sections?|chapters?|parts?|phases?|stages?|commits?)\b/i;
+
+function checkStaleVersions(files, pkgs) {
   const installed = new Map(); // name -> Set of majors
-  for (const f of walk(root, 0)) {
-    if (path.basename(f) !== "package.json") continue;
-    try {
-      const pkg = JSON.parse(fs.readFileSync(f, "utf8"));
-      const all = { ...pkg.dependencies, ...pkg.devDependencies, ...pkg.engines };
-      for (const name of VERSIONED) {
-        const v = all[name];
-        if (!v) continue;
-        const m = String(v).match(/\d+/);
-        if (!m) continue;
+  for (const pkg of pkgs) {
+    const all = { ...pkg.dependencies, ...pkg.devDependencies, ...pkg.engines };
+    for (const name of VERSIONED) {
+      const v = all[name];
+      if (!v || NONSEMVER_DEP.test(String(v).trim())) continue;
+      for (const m of String(v).matchAll(/(?:^|[^\d.])(\d+)(?:\.|$)/g)) {
         if (!installed.has(name)) installed.set(name, new Set());
-        installed.get(name).add(m[0]);
+        installed.get(name).add(m[1]);
       }
-    } catch {}
+    }
   }
   if (!installed.size) return [];
   const alias = { tailwind: "tailwindcss", nodejs: "node" };
@@ -359,6 +376,9 @@ function checkStaleVersions(files, root) {
     f.prose.split("\n").forEach((line, i) => {
       for (const m of line.matchAll(re)) {
         const name = alias[m[1].toLowerCase()] || m[1].toLowerCase();
+        // lowercase "next" is usually the English word; require Next, next.js, or next vN
+        if (name === "next" && !/^(Next|next\.js|next[ -]v)/.test(m[0])) continue;
+        if (COUNT_NOUN.test(line.slice(m.index + m[0].length))) continue;
         const majors = installed.get(name);
         if (!majors || majors.has(m[2])) continue;
         const key = name + "|" + m[2] + "|" + f.path;
@@ -379,21 +399,36 @@ function checkStaleVersions(files, root) {
 // silently never load. check the static prefix of each glob.
 function checkDeadGlobs(files, root) {
   const findings = [];
-  const re = /^[ \t]*(?:globs?|applyTo)[ \t]*:[ \t]*(\S.*?)[ \t]*$/gim;
+  const inline = /^[ \t]*(?:globs?|applyTo)[ \t]*:[ \t]*(\S.*?)[ \t]*$/gim;
+  const listKey = /^[ \t]*(?:globs?|applyTo)[ \t]*:$/;
+  const clean = s => s.trim().replace(/^\[|\]$/g, "").trim().replace(/^["']|["']$/g, "");
+  const check = (f, glob, line) => {
+    const prefix = glob.split(/[*{[]/)[0].replace(/\/+$/, "");
+    if (!prefix || prefix.length < 2 || prefix === ".") return;
+    if (!pathExists(root, path.dirname(f.path), prefix)) {
+      findings.push({ kind: "DEAD GLOB", ref: glob, file: rel(root, f.path), line, note: "glob prefix does not exist; rule never loads" });
+    }
+  };
   for (const f of files) {
     if (!/\.(mdc|instructions\.md)$/i.test(f.path)) continue;
     const fm = f.text.match(/^---\n([\s\S]*?)\n---/);
     if (!fm) continue;
-    for (const m of fm[1].matchAll(re)) {
-      for (const glob of m[1].split(/[,;]/).map(s => s.trim().replace(/^["']|["']$/g, ""))) {
-        const prefix = glob.split(/[*{[]/)[0].replace(/\/+$/, "");
-        if (!prefix || prefix.length < 2) continue;
-        const line = f.text.slice(0, fm.index + 4 + m.index).split("\n").length;
-        if (!pathExists(root, path.dirname(f.path), prefix)) {
-          findings.push({ kind: "DEAD GLOB", ref: glob, file: rel(root, f.path), line, note: "glob prefix does not exist; rule never loads" });
-        }
-      }
+    // inline form: "globs: src/**" or "globs: [a/**, b/**]". file line =
+    // fm line + 1, since fm[1] starts after the opening "---" line.
+    for (const m of fm[1].matchAll(inline)) {
+      const line = fm[1].slice(0, m.index).split("\n").length + 1;
+      for (const glob of m[1].split(/[,;]/).map(clean)) check(f, glob, line);
     }
+    // yaml list form: "globs:" followed by "- *.x" lines
+    const fmLines = fm[1].split("\n");
+    fmLines.forEach((l, li) => {
+      if (!listKey.test(l)) return;
+      for (let k = li + 1; k < fmLines.length; k++) {
+        const item = fmLines[k].match(/^[ \t]*-[ \t]*(.+)$/);
+        if (!item) break;
+        check(f, clean(item[1].replace(/\s+#.*$/, "")), k + 2);
+      }
+    });
   }
   return findings;
 }
@@ -416,20 +451,20 @@ function run(root, opts) {
     try {
       const buf = fs.readFileSync(f.path);
       if (buf.includes(0)) return []; // binary
-      const text = buf.toString("utf8").replace(/\r\n?/g, "\n");
-      return [{ ...f, text, prose: stripFences(text) }];
+      const text = buf.toString("utf8").replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+      return [{ ...f, text, prose: stripFences(stripFrontmatter(text)) }];
     } catch { return []; } // unreadable, vanished mid-run, etc.
   });
 
-  const scripts = opts.user ? new Set() : collectScripts(root);
+  const pkgs = opts.user ? [] : collectPkgs(root);
   const findings = [
     ...checkConflicts(files, root),
     ...checkDeadRefs(files, root),
-    ...checkDeadCmds(files, root, scripts),
+    ...checkDeadCmds(files, root, collectScripts(pkgs)),
     ...checkDuplicates(files, root),
     ...checkDeadGlobs(files, root),
   ];
-  if (!opts.user) findings.push(...checkStaleVersions(files, root));
+  if (!opts.user) findings.push(...checkStaleVersions(files, pkgs));
 
   const hasAgents = files.some(f => path.basename(f.path) === "AGENTS.md");
   if (files.length && !hasAgents && !opts.user) {
@@ -495,7 +530,7 @@ function printReport(root, r, opts) {
       console.log(`  ${c}DEAD REF${C.reset}  ${f.ref}`);
       console.log(`          ${f.file}:${f.line}  ${C.dim}file does not exist${C.reset}`);
     } else if (f.kind === "DEAD CMD") {
-      console.log(`  ${c}DEAD CMD${C.reset}  npm run ${f.cmd}`);
+      console.log(`  ${c}DEAD CMD${C.reset}  ${f.raw || "npm run " + f.cmd}`);
       console.log(`          ${f.file}:${f.line}  ${C.dim}no "${f.cmd}" script in any package.json${C.reset}`);
     } else if (f.kind === "DUPLICATE") {
       console.log(`  ${c}DUPLICATE${C.reset} ~${f.len}-char block in ${f.files.length} files`);
