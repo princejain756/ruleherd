@@ -1,0 +1,37 @@
+{
+  "name": "ruleherd",
+  "version": "0.1.0",
+  "description": "Audit the agent instruction files you already have. Finds contradictions, dead references, and duplicated rules across CLAUDE.md, AGENTS.md, .cursor/rules, copilot-instructions and friends.",
+  "keywords": [
+    "claude",
+    "cursor",
+    "agents-md",
+    "claude-md",
+    "copilot",
+    "windsurf",
+    "ai-agents",
+    "lint",
+    "cli"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "ruleherd": "bin/ruleherd.mjs"
+  },
+  "scripts": {
+    "test": "node test/run.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin"
+  ],
+  "author": "Prince Jain",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/princejain756/ruleherd"
+  },
+  "homepage": "https://github.com/princejain756/ruleherd",
+  "bugs": "https://github.com/princejain756/ruleherd/issues"
+}
