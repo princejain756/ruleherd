@@ -1,6 +1,6 @@
 {
   "name": "ruleherd",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Audit the agent instruction files you already have. Finds contradictions, dead references, and duplicated rules across CLAUDE.md, AGENTS.md, .cursor/rules, copilot-instructions and friends.",
   "keywords": [
     "claude",

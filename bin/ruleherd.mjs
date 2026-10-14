@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const HOME = os.homedir();
 
 // ---------- discovery ----------
@@ -23,7 +23,6 @@ const RULE_DIRS = [
   { dir: ".clinerules", label: "cline" },
   { dir: ".agents/rules", label: "agents" },
   { dir: ".github/instructions", label: "copilot" },
-  { dir: "rules", label: "rules" },
 ];
 
 const USER_FILES = [
@@ -43,6 +42,8 @@ const USER_DIRS = [
   { dir: "~/.config/agents/rules", label: "agents" },
 ];
 
+const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "vendor", "out", "coverage"]);
+
 function expandHome(p) {
   return p.startsWith("~/") ? path.join(HOME, p.slice(2)) : p;
 }
@@ -53,13 +54,27 @@ function* walk(dir, depth) {
   catch { return; }
   for (const e of entries) {
     const full = path.join(dir, e.name);
-    if (e.isDirectory()) {
-      if (["node_modules", ".git", "dist", "build", ".next", "vendor"].includes(e.name)) continue;
+    let isDir = e.isDirectory(), isFile = e.isFile();
+    if (!isDir && !isFile && e.isSymbolicLink()) {
+      try {
+        const st = fs.statSync(full);
+        isDir = st.isDirectory(); isFile = st.isFile();
+      } catch { continue; }
+    }
+    if (isDir) {
+      if (SKIP_DIRS.has(e.name)) continue;
       if (depth < 3) yield* walk(full, depth + 1);
-    } else if (e.isFile()) {
+    } else if (isFile) {
       yield full;
     }
   }
+}
+
+function addFound(found, p, label, mtime) {
+  let real;
+  try { real = fs.realpathSync(p); } catch { real = p; }
+  if (found.has(real)) return; // symlink aliases are one file, not a duplicate
+  found.set(real, { path: p, label, mtime });
 }
 
 function discover(root) {
@@ -67,7 +82,7 @@ function discover(root) {
   const add = (p, label) => {
     try {
       const st = fs.statSync(p);
-      if (st.isFile() && st.size > 0) found.set(p, { path: p, label, mtime: st.mtime });
+      if (st.isFile() && st.size > 0) addFound(found, p, label, st.mtime);
     } catch {}
   };
 
@@ -75,7 +90,9 @@ function discover(root) {
 
   for (const { dir, label } of RULE_DIRS) {
     const abs = path.join(root, dir);
-    if (!fs.existsSync(abs)) continue;
+    try {
+      if (!fs.statSync(abs).isDirectory()) continue;
+    } catch { continue; }
     for (const f of walk(abs, 0)) add(f, label);
   }
 
@@ -83,7 +100,7 @@ function discover(root) {
   const names = new Set(["CLAUDE.md", "AGENTS.md", "GEMINI.md"]);
   for (const f of walk(root, 0)) {
     const base = path.basename(f);
-    if (names.has(base) && !found.has(f)) add(f, base);
+    if (names.has(base)) add(f, base);
   }
   return [...found.values()];
 }
@@ -93,13 +110,15 @@ function discoverUser() {
   const add = (p, label) => {
     try {
       const st = fs.statSync(p);
-      if (st.isFile() && st.size > 0) found.set(p, { path: p, label, mtime: st.mtime });
+      if (st.isFile() && st.size > 0) addFound(found, p, label, st.mtime);
     } catch {}
   };
   for (const { file, label } of USER_FILES) add(expandHome(file), label);
   for (const { dir, label } of USER_DIRS) {
     const abs = expandHome(dir);
-    if (!fs.existsSync(abs)) continue;
+    try {
+      if (!fs.statSync(abs).isDirectory()) continue;
+    } catch { continue; }
     for (const f of walk(abs, 0)) add(f, label);
   }
   return [...found.values()];
@@ -107,69 +126,83 @@ function discoverUser() {
 
 // ---------- checks ----------
 
+// repo-relative when inside root, ~/... when under HOME but outside root,
+// absolute otherwise.
 const rel = (root, p) => {
-  if (p.startsWith(HOME + path.sep)) return "~" + p.slice(HOME.length);
   const r = path.relative(root, p);
-  return r.startsWith("..") ? p : r || p;
+  if (r && !r.startsWith(".." + path.sep) && r !== ".." && !path.isAbsolute(r)) return r;
+  if (!r) return path.basename(p);
+  if (p.startsWith(HOME + path.sep)) return "~" + p.slice(HOME.length);
+  return p;
 };
+
+// fenced code blocks hold examples, not rules. mask them (length-preserving,
+// keeps line numbers aligned) for checks that would flag examples as refs.
+const stripFences = t => t.replace(/```[\s\S]*?(?:```|$)/g, m => " ".repeat(m.length));
 
 // contradiction topics: [name, regexA label, regexA, regexB label, regexB]
 const TOPIC_PAIRS = [
-  ["package manager", "npm", /\bnpm (run|install|ci|test|publish|exec|i )\b/, "pnpm/yarn/bun", /\b(pnpm|yarn|bun) (run|install|add|test|dlx|exec)?\b/],
-  ["test runner", "jest", /\bjest\b/, "vitest/mocha", /\b(vitest|mocha)\b/],
-  ["indentation", "tabs", /\b(indent|use|with) .{0,20}\btabs?\b|\btabs? (for|as) indent/i, "spaces", /\b(indent|use|with) .{0,20}\bspaces?\b|\bspaces? (for|as) indent/i],
-  ["module system", "ESM", /\b(esm|es modules|type.{0,4}module|import .{0,30}from)\b/i, "CommonJS", /\b(commonjs|cjs|require\()\b/i],
-  ["formatter", "prettier", /\bprettier\b/i, "biome/eslint-format", /\b(biome|eslint --fix|standardjs)\b/i],
+  ["package manager", "npm", /\bnpm (?:run|install|ci|test|publish|exec|i)\b/, "pnpm/yarn/bun", /\b(?:pnpm|yarn|bun) (?:run|install|add|test|dlx|exec|i|remove|update|create)\b/],
+  ["test runner", "jest", /\bjest\b/, "vitest/mocha", /\b(?:vitest|mocha)\b/],
+  ["indentation", "tabs", /\b(?:indent|use|with)\b.{0,20}\btabs?\b|\btabs?\s+(?:for|as)\s+indent/i, "spaces", /\b(?:indent|use|with)\b.{0,20}\bspaces?\b|\bspaces?\s+(?:for|as)\s+indent/i],
+  ["module system", "ESM", /\b(?:esm|es modules|"type"\s*:\s*"module"|import\s+[\w*{}\s,]+\s+from\s+['"])/i, "CommonJS", /\b(?:commonjs|cjs|require\s*\()/i],
+  ["formatter", "prettier", /\bprettier\b/i, "biome/eslint-format", /\b(?:biome|eslint --fix|standardjs)\b/i],
 ];
 
 const POLARITY = [/\bnever\b/i, /\bdon't\b|\bdo not\b/i, /\balways\b/i, /\bmust\b/i, /\bno \w+ing\b/i];
-const POLARITY_TOPICS = /\b(commit|push|test|delete|edit|merge|rebase|sudo|console\.log|secrets?|api keys?)\b/i;
+const TOPIC_RE = /\b(commit|push|tests?|delete|edit|merge|rebase|sudo|console\.log|secrets?|api keys?)\b/gi;
+const CLAUSE_SPLIT = /[.;]|,\s*(?:and|but)\b/i;
 
 function checkConflicts(files, root) {
   const findings = [];
   for (const [topic, aLabel, aRe, bLabel, bRe] of TOPIC_PAIRS) {
     const aHits = [], bHits = [];
     for (const f of files) {
-      const lines = f.text.split("\n");
-      lines.forEach((line, i) => {
+      f.prose.split("\n").forEach((line, i) => {
         if (aRe.test(line) && !bRe.test(line)) aHits.push({ f, i, line: line.trim() });
         if (bRe.test(line) && !aRe.test(line)) bHits.push({ f, i, line: line.trim() });
       });
     }
-    if (aHits.length && bHits.length) {
-      // only a conflict if the sides come from different files
-      const aFiles = new Set(aHits.map(h => h.f.path));
-      const bFiles = new Set(bHits.map(h => h.f.path));
-      const conflictFiles = [...aFiles].some(p => bFiles.has(p)) ? false : true;
-      if (conflictFiles || [...aFiles].some(p => !bFiles.has(p))) {
-        findings.push({
-          kind: "CONFLICT", topic,
-          a: aHits[0], b: bHits[0],
-          aLabel, bLabel,
-        });
-      }
+    // a real conflict needs the two sides in different files
+    const pair = aHits.flatMap(a => bHits.map(b => [a, b])).find(([a, b]) => a.f.path !== b.f.path);
+    if (pair) {
+      findings.push({ kind: "CONFLICT", topic, a: pair[0], b: pair[1], aLabel, bLabel });
     }
   }
-  // polarity on shared topics across files
-  const perFile = files.map(f => ({
-    f,
-    polarityLines: f.text.split("\n").map((line, i) => ({ i, line: line.trim() }))
-      .filter(({ line }) => POLARITY.some(p => p.test(line)) && POLARITY_TOPICS.test(line)),
-  }));
+
+  // never/always polarity on shared topics, per clause
+  const emitted = new Set();
+  const perFile = files.map(f => {
+    const entries = [];
+    f.prose.split("\n").forEach((line, i) => {
+      for (const clause of line.split(CLAUSE_SPLIT)) {
+        const c = clause.trim();
+        if (!POLARITY.some(p => p.test(c))) continue;
+        const pos = /\balways\b|\bmust\b/i.test(c);
+        const neg = /\bnever\b|\bdon't\b|\bdo not\b|\bno \w+ing\b/i.test(c);
+        if (pos === neg) continue;
+        for (const m of c.matchAll(TOPIC_RE)) {
+          const topic = m[1].toLowerCase().replace(/s$/, "");
+          entries.push({ topic, pos, i, line: c });
+        }
+      }
+    });
+    return { f, entries };
+  });
   for (let i = 0; i < perFile.length; i++) {
     for (let j = i + 1; j < perFile.length; j++) {
-      const topicsOf = line => new Set([...line.matchAll(new RegExp(POLARITY_TOPICS.source, "gi"))].map(m => m[1].toLowerCase()));
-      for (const a of perFile[i].polarityLines) {
-        for (const b of perFile[j].polarityLines) {
-          const shared = [...topicsOf(a.line)].filter(t => topicsOf(b.line).has(t));
-          if (!shared.length) continue;
-          const posA = /\balways\b|\bmust\b/i.test(a.line);
-          const negA = /\bnever\b|\bdon't\b|\bdo not\b|\bno \w+ing\b/i.test(a.line);
-          const posB = /\balways\b|\bmust\b/i.test(b.line);
-          const negB = /\bnever\b|\bdon't\b|\bdo not\b|\bno \w+ing\b/i.test(b.line);
-          if ((posA && negB) || (negA && posB)) {
-            findings.push({ kind: "CONFLICT", topic: shared[0] + " policy", a: { f: perFile[i].f, ...a }, b: { f: perFile[j].f, ...b }, aLabel: "", bLabel: "" });
-          }
+      for (const a of perFile[i].entries) {
+        for (const b of perFile[j].entries) {
+          if (a.topic !== b.topic || a.pos === b.pos) continue;
+          const key = perFile[i].f.path + "|" + perFile[j].f.path + "|" + a.topic;
+          if (emitted.has(key)) continue;
+          emitted.add(key);
+          findings.push({
+            kind: "CONFLICT", topic: a.topic + " policy",
+            a: { f: perFile[i].f, i: a.i, line: a.line },
+            b: { f: perFile[j].f, i: b.i, line: b.line },
+            aLabel: "", bLabel: "",
+          });
         }
       }
     }
@@ -204,7 +237,9 @@ function checkDuplicates(files, root) {
 // backticked paths: known file extension anywhere, or explicit ./ ../ ~/ prefix.
 // bare slash-words without an extension (model ids, slash commands) are skipped.
 const PATH_RE = /`((?:~|\.{1,2})\/[\w.@+\/-]+|[\w.@+][\w.@+\/-]*\.(?:md|mdc|json|jsonc|ya?ml|toml|sh|py|ts|tsx|js|mjs|cjs|txt|cfg|ini|rb|go|rs))`/g;
-const IMPORT_RE = /^@([\w./~-]+\.[a-z]+)/gim;
+// @file imports (claude code style). requires a file extension so @scope/pkg
+// package names in prose don't match.
+const IMPORT_RE = /(?:^|[\s(-])@((?:~|\.{1,2}\/)?[\w.@+\/-]+\.(?:md|mdc|json|jsonc|ya?ml|toml|sh|py|ts|tsx|js|mjs|cjs|txt))\b/gi;
 
 function pathExists(root, fromDir, p) {
   if (/^https?:/.test(p)) return true;
@@ -228,8 +263,7 @@ function checkDeadRefs(files, root) {
   const findings = [];
   for (const f of files) {
     const dir = path.dirname(f.path);
-    const lines = f.text.split("\n");
-    lines.forEach((line, i) => {
+    f.prose.split("\n").forEach((line, i) => {
       for (const m of line.matchAll(PATH_RE)) {
         const p = m[1];
         const firstSeg = p.replace(/^(~|\.{1,2})\//, "").split("/")[0];
@@ -243,6 +277,8 @@ function checkDeadRefs(files, root) {
       }
       for (const m of line.matchAll(IMPORT_RE)) {
         const p = m[1];
+        const firstSeg = p.replace(/^(~|\.{1,2})\//, "").split("/")[0];
+        if (EXAMPLE_DIRS.has(firstSeg)) continue;
         if (!pathExists(root, dir, p)) {
           findings.push({ kind: "DEAD REF", ref: "@" + p, file: rel(root, f.path), line: i + 1 });
         }
@@ -252,21 +288,112 @@ function checkDeadRefs(files, root) {
   return findings;
 }
 
-function checkDeadCmds(files, root) {
-  const pkgPath = path.join(root, "package.json");
-  if (!fs.existsSync(pkgPath)) return [];
-  let scripts = {};
-  try { scripts = JSON.parse(fs.readFileSync(pkgPath, "utf8")).scripts || {}; } catch { return []; }
+const PM_BUILTINS = new Set([
+  "install", "add", "remove", "rm", "uninstall", "dlx", "exec", "init",
+  "create", "publish", "cache", "config", "why", "list", "ls", "outdated",
+  "update", "upgrade", "link", "unlink", "audit", "pack", "info", "help",
+  "version", "run", "-r", "--recursive", "import", "rebuild", "prune",
+]);
+
+function collectScripts(root) {
+  const scripts = new Set();
+  for (const f of walk(root, 0)) {
+    if (path.basename(f) !== "package.json") continue;
+    try {
+      const s = JSON.parse(fs.readFileSync(f, "utf8")).scripts || {};
+      for (const k of Object.keys(s)) scripts.add(k);
+    } catch {}
+  }
+  return scripts;
+}
+
+function checkDeadCmds(files, root, scripts) {
+  if (!scripts.size) return [];
   const findings = [];
-  const re = /`(?:npm run|pnpm|yarn) ([\w:.-]+)`/g;
+  const explicit = /`(?:npm run|pnpm run|yarn run|bun run) ([\w:.-]+)`/g;
+  const bare = /`(?:pnpm|yarn|bun) ([\w:.-]+)`/g;
   for (const f of files) {
-    f.text.split("\n").forEach((line, i) => {
-      for (const m of line.matchAll(re)) {
-        if (!(m[1] in scripts)) {
+    f.prose.split("\n").forEach((line, i) => {
+      for (const m of line.matchAll(explicit)) {
+        if (!scripts.has(m[1])) {
+          findings.push({ kind: "DEAD CMD", cmd: m[1], file: rel(root, f.path), line: i + 1 });
+        }
+      }
+      for (const m of line.matchAll(bare)) {
+        // bare `pnpm x` runs script x, but builtin subcommands aren't scripts
+        if (!PM_BUILTINS.has(m[1]) && !scripts.has(m[1])) {
           findings.push({ kind: "DEAD CMD", cmd: m[1], file: rel(root, f.path), line: i + 1 });
         }
       }
     });
+  }
+  return findings;
+}
+
+// stale tech-version mentions: "react 17" in rules while package.json has ^19
+const VERSIONED = ["react", "next", "vue", "svelte", "angular", "tailwindcss", "typescript", "node", "prisma", "zod", "vite"];
+
+function checkStaleVersions(files, root) {
+  const installed = new Map(); // name -> Set of majors
+  for (const f of walk(root, 0)) {
+    if (path.basename(f) !== "package.json") continue;
+    try {
+      const pkg = JSON.parse(fs.readFileSync(f, "utf8"));
+      const all = { ...pkg.dependencies, ...pkg.devDependencies, ...pkg.engines };
+      for (const name of VERSIONED) {
+        const v = all[name];
+        if (!v) continue;
+        const m = String(v).match(/\d+/);
+        if (!m) continue;
+        if (!installed.has(name)) installed.set(name, new Set());
+        installed.get(name).add(m[0]);
+      }
+    } catch {}
+  }
+  if (!installed.size) return [];
+  const alias = { tailwind: "tailwindcss", nodejs: "node" };
+  const re = new RegExp(`\\b(${[...VERSIONED, "tailwind", "nodejs"].join("|")})[ -]?v?(\\d{1,2})\\b`, "gi");
+  const findings = [];
+  const emitted = new Set();
+  for (const f of files) {
+    f.prose.split("\n").forEach((line, i) => {
+      for (const m of line.matchAll(re)) {
+        const name = alias[m[1].toLowerCase()] || m[1].toLowerCase();
+        const majors = installed.get(name);
+        if (!majors || majors.has(m[2])) continue;
+        const key = name + "|" + m[2] + "|" + f.path;
+        if (emitted.has(key)) continue;
+        emitted.add(key);
+        findings.push({
+          kind: "STALE", ref: `${m[1]} ${m[2]}`,
+          file: rel(root, f.path), line: i + 1,
+          note: `package.json has ${name} ${[...majors].join("/")}`,
+        });
+      }
+    });
+  }
+  return findings;
+}
+
+// cursor/copilot scoped rules whose glob prefix points at a deleted directory
+// silently never load. check the static prefix of each glob.
+function checkDeadGlobs(files, root) {
+  const findings = [];
+  const re = /^[ \t]*(?:globs?|applyTo)[ \t]*:[ \t]*(\S.*?)[ \t]*$/gim;
+  for (const f of files) {
+    if (!/\.(mdc|instructions\.md)$/i.test(f.path)) continue;
+    const fm = f.text.match(/^---\n([\s\S]*?)\n---/);
+    if (!fm) continue;
+    for (const m of fm[1].matchAll(re)) {
+      for (const glob of m[1].split(/[,;]/).map(s => s.trim().replace(/^["']|["']$/g, ""))) {
+        const prefix = glob.split(/[*{[]/)[0].replace(/\/+$/, "");
+        if (!prefix || prefix.length < 2) continue;
+        const line = f.text.slice(0, fm.index + 4 + m.index).split("\n").length;
+        if (!pathExists(root, path.dirname(f.path), prefix)) {
+          findings.push({ kind: "DEAD GLOB", ref: glob, file: rel(root, f.path), line, note: "glob prefix does not exist; rule never loads" });
+        }
+      }
+    }
   }
   return findings;
 }
@@ -278,22 +405,31 @@ const C = {
   red: "\x1b[31m", yellow: "\x1b[33m", green: "\x1b[32m",
   cyan: "\x1b[36m", blue: "\x1b[34m", magenta: "\x1b[35m",
 };
-const KIND_COLOR = { CONFLICT: C.red, "DEAD REF": C.yellow, "DEAD CMD": C.yellow, DUPLICATE: C.magenta, MISSING: C.blue };
+const KIND_COLOR = { CONFLICT: C.red, "DEAD REF": C.yellow, "DEAD CMD": C.yellow, DUPLICATE: C.magenta, MISSING: C.blue, BLOAT: C.yellow, STALE: C.yellow, "DEAD GLOB": C.yellow };
 
 function grade(score) {
   return score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F";
 }
 
 function run(root, opts) {
-  const files = (opts.user ? discoverUser() : discover(root))
-    .map(f => ({ ...f, text: fs.readFileSync(f.path, "utf8") }));
+  const files = (opts.user ? discoverUser() : discover(root)).flatMap(f => {
+    try {
+      const buf = fs.readFileSync(f.path);
+      if (buf.includes(0)) return []; // binary
+      const text = buf.toString("utf8").replace(/\r\n?/g, "\n");
+      return [{ ...f, text, prose: stripFences(text) }];
+    } catch { return []; } // unreadable, vanished mid-run, etc.
+  });
 
+  const scripts = opts.user ? new Set() : collectScripts(root);
   const findings = [
     ...checkConflicts(files, root),
     ...checkDeadRefs(files, root),
-    ...checkDeadCmds(files, root),
+    ...checkDeadCmds(files, root, scripts),
     ...checkDuplicates(files, root),
+    ...checkDeadGlobs(files, root),
   ];
+  if (!opts.user) findings.push(...checkStaleVersions(files, root));
 
   const hasAgents = files.some(f => path.basename(f.path) === "AGENTS.md");
   if (files.length && !hasAgents && !opts.user) {
@@ -301,6 +437,11 @@ function run(root, opts) {
   }
 
   const perFile = files.map(f => ({ ...f, tokens: Math.round(f.text.length / 4) }));
+  for (const f of perFile) {
+    if (f.tokens > 4000) {
+      findings.push({ kind: "BLOAT", file: rel(root, f.path), note: `~${f.tokens.toLocaleString()} tokens load into every prompt` });
+    }
+  }
   const totalTokens = perFile.reduce((s, f) => s + f.tokens, 0);
 
   let score = 100;
@@ -309,6 +450,9 @@ function run(root, opts) {
   score -= Math.min(24, count("DEAD REF") * 6);
   score -= Math.min(20, count("DEAD CMD") * 8);
   score -= Math.min(15, count("DUPLICATE") * 5);
+  score -= Math.min(10, count("STALE") * 4);
+  score -= Math.min(10, count("DEAD GLOB") * 5);
+  score -= Math.min(10, count("BLOAT") * 5);
   score -= Math.min(5, count("MISSING") * 5);
   score = Math.max(0, score);
 
@@ -352,12 +496,20 @@ function printReport(root, r, opts) {
       console.log(`          ${f.file}:${f.line}  ${C.dim}file does not exist${C.reset}`);
     } else if (f.kind === "DEAD CMD") {
       console.log(`  ${c}DEAD CMD${C.reset}  npm run ${f.cmd}`);
-      console.log(`          ${f.file}:${f.line}  ${C.dim}no "${f.cmd}" script in package.json${C.reset}`);
+      console.log(`          ${f.file}:${f.line}  ${C.dim}no "${f.cmd}" script in any package.json${C.reset}`);
     } else if (f.kind === "DUPLICATE") {
       console.log(`  ${c}DUPLICATE${C.reset} ~${f.len}-char block in ${f.files.length} files`);
       for (const p of f.files) console.log(`          ${C.dim}${p}${C.reset}`);
     } else if (f.kind === "MISSING") {
       console.log(`  ${c}MISSING${C.reset}   ${f.file}  ${C.dim}${f.note}${C.reset}`);
+    } else if (f.kind === "BLOAT") {
+      console.log(`  ${c}BLOAT${C.reset}     ${f.file}  ${C.dim}${f.note}${C.reset}`);
+    } else if (f.kind === "STALE") {
+      console.log(`  ${c}STALE${C.reset}     ${f.ref} in ${f.file}:${f.line}`);
+      console.log(`          ${C.dim}${f.note}${C.reset}`);
+    } else if (f.kind === "DEAD GLOB") {
+      console.log(`  ${c}DEAD GLOB${C.reset} ${f.ref} in ${f.file}:${f.line}`);
+      console.log(`          ${C.dim}${f.note}${C.reset}`);
     }
   }
   console.log(`\n${C.dim}fix the conflicts first. dead refs and dupes are why your agents disagree.${C.reset}\n`);
@@ -384,7 +536,8 @@ usage:
   ruleherd --strict   exit 1 if any finding (for CI)
 
 finds: contradictions between files, dead file refs, commands that don't
-exist in package.json, blocks copy-pasted across files, missing AGENTS.md.`);
+exist in package.json, stale version mentions, dead rule globs, blocks
+copy-pasted across files, missing AGENTS.md.`);
   process.exit(0);
 }
 
