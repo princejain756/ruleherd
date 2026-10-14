@@ -30,7 +30,7 @@
   "author": "Prince Jain",
   "repository": {
     "type": "git",
-    "url": "https://github.com/princejain756/ruleherd"
+    "url": "git+https://github.com/princejain756/ruleherd.git"
   },
   "homepage": "https://github.com/princejain756/ruleherd",
   "bugs": "https://github.com/princejain756/ruleherd/issues"
