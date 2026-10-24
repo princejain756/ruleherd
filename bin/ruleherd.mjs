@@ -611,22 +611,37 @@ function printReport(root, r, opts) {
 // ---------- cli ----------
 
 const args = process.argv.slice(2);
+function getVal(flag) {
+  const eq = args.find(a => a.startsWith(flag + "="));
+  if (eq) return eq.slice(flag.length + 1);
+  const i = args.indexOf(flag);
+  if (i === -1) return null;
+  return args[i + 1] || null;
+}
+const rawFormat = getVal("--format") || (args.includes("--json") ? "json" : "text");
+if (!["text", "json", "github", "sarif"].includes(rawFormat)) {
+  console.error("ruleherd: --format must be text, json, github, or sarif");
+  process.exit(2);
+}
 const opts = {
   user: args.includes("--user") || args.includes("-u"),
-  json: args.includes("--json"),
+  json: rawFormat === "json",
+  format: rawFormat,
   help: args.includes("--help") || args.includes("-h"),
   strict: args.includes("--strict"),
 };
-const dirArg = args.find(a => !a.startsWith("-"));
+const fmtIdx = args.indexOf("--format");
+const dirArg = args.find((a, i) => !a.startsWith("-") && (fmtIdx === -1 || i !== fmtIdx + 1));
 
 if (opts.help) {
   console.log(`ruleherd ${VERSION} - audit agent instruction files for drift
 
 usage:
-  ruleherd [dir]      audit a repo (default: cwd)
-  ruleherd --user     audit your global config files (~/.claude, ~/.cursor, ...)
-  ruleherd --json     machine-readable output
-  ruleherd --strict   exit 1 if any finding (for CI)
+  ruleherd [dir]             audit a repo (default: cwd)
+  ruleherd --user            audit your global config files (~/.claude, ~/.cursor, ...)
+  ruleherd --json            machine-readable JSON output
+  ruleherd --format <fmt>    output format: text (default), json, github, sarif
+  ruleherd --strict          exit 1 if any finding (for CI)
 
 finds: contradictions between files, dead file refs, commands that don't
 exist in package.json, stale version mentions, dead rule globs, blocks
@@ -634,16 +649,106 @@ copy-pasted across files, missing AGENTS.md.`);
   process.exit(0);
 }
 
+function githubReport(displayRoot, r) {
+  const escProp = s => String(s ?? "").replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/:/g, "%3A").replace(/,/g, "%2C");
+  const escData = s => String(s ?? "").replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+  const lines = [];
+  for (const f of r.findings) {
+    if (f.kind === "CONFLICT") {
+      const fileA = rel(displayRoot, f.a.f.path);
+      const fileB = rel(displayRoot, f.b.f.path);
+      lines.push(`::error file=${escProp(fileA)},line=${f.a.i + 1},title=CONFLICT (${escProp(f.topic)})::${escData(`Conflicts with ${fileB}:${f.b.i + 1} ("${f.b.line.slice(0, 70)}")`)}`);
+    } else if (f.kind === "DEAD REF" || f.kind === "DEAD CMD" || f.kind === "STALE" || f.kind === "DEAD GLOB") {
+      const label = f.ref || f.raw || f.cmd;
+      lines.push(`::warning file=${escProp(f.file)},line=${f.line || 1},title=${escProp(f.kind)}::${escData(`${label}${f.note ? ` - ${f.note}` : ""}`)}`);
+    } else if (f.kind === "DUPLICATE") {
+      lines.push(`::notice file=${escProp(f.files[0])},title=DUPLICATE::${escData(`~${f.len}-char block duplicated across ${f.files.join(", ")}`)}`);
+    } else if (f.kind === "MISSING" || f.kind === "BLOAT") {
+      lines.push(`::notice file=${escProp(f.file)},title=${escProp(f.kind)}::${escData(f.note || f.file)}`);
+    }
+  }
+  lines.push(`::notice title=ruleherd::grade ${r.grade} (${r.score}/100)`);
+  return lines.join("\n");
+}
+
+function sarifReport(displayRoot, r) {
+  const rulesMap = new Map();
+  const results = [];
+  for (const f of r.findings) {
+    const ruleId = f.kind.toLowerCase().replace(/\s+/g, "-");
+    const level = f.kind === "CONFLICT" ? "error" : f.kind === "DUPLICATE" || f.kind === "MISSING" || f.kind === "BLOAT" ? "note" : "warning";
+    if (!rulesMap.has(ruleId)) {
+      rulesMap.set(ruleId, {
+        id: ruleId,
+        shortDescription: { text: `ruleherd ${f.kind}` },
+        defaultConfiguration: { level },
+      });
+    }
+    const fileUri = f.kind === "CONFLICT" ? rel(displayRoot, f.a.f.path) : f.kind === "DUPLICATE" ? f.files[0] : f.file || "AGENTS.md";
+    const startLine = f.kind === "CONFLICT" ? f.a.i + 1 : f.line || 1;
+    const msg =
+      f.kind === "CONFLICT"
+        ? `Conflict on ${f.topic} between ${rel(displayRoot, f.a.f.path)}:${f.a.i + 1} and ${rel(displayRoot, f.b.f.path)}:${f.b.i + 1}`
+        : f.kind === "DUPLICATE"
+          ? `~${f.len}-char block duplicated across ${f.files.join(", ")}`
+          : `${f.kind}: ${f.ref || f.raw || f.cmd || f.file}${f.note ? ` (${f.note})` : ""}`;
+    results.push({
+      ruleId,
+      level,
+      message: { text: msg },
+      locations: [
+        {
+          physicalLocation: {
+            artifactLocation: { uri: fileUri },
+            region: { startLine: Math.max(1, startLine) },
+          },
+        },
+      ],
+    });
+  }
+  return JSON.stringify(
+    {
+      $schema: "https://json.schemastore.org/sarif-2.1.0.json",
+      version: "2.1.0",
+      runs: [
+        {
+          tool: {
+            driver: {
+              name: "ruleherd",
+              version: VERSION,
+              informationUri: "https://github.com/princejain756/ruleherd",
+              rules: Array.from(rulesMap.values()),
+            },
+          },
+          properties: {
+            root: displayRoot,
+            score: r.score,
+            grade: r.grade,
+            totalTokens: r.totalTokens,
+          },
+          results,
+        },
+      ],
+    },
+    null,
+    2,
+  );
+}
+
 const root = path.resolve(dirArg || ".");
 const displayRoot = opts.user ? HOME : root;
 const r = run(root, opts);
 
-if (opts.json) {
+if (opts.format === "json") {
   console.log(JSON.stringify({
     root: displayRoot, score: r.score, grade: r.grade, files: r.files.map(f => rel(displayRoot, f.path)),
     totalTokens: r.totalTokens,
     findings: r.findings.map(f => ({ ...f, aLabel: f.aLabel || undefined, bLabel: f.bLabel || undefined, a: f.a && { file: rel(displayRoot, f.a.f.path), line: f.a.i + 1, text: f.a.line }, b: f.b && { file: rel(displayRoot, f.b.f.path), line: f.b.i + 1, text: f.b.line } })),
   }, null, 2));
+} else if (opts.format === "github") {
+  console.log(githubReport(displayRoot, r));
+} else if (opts.format === "sarif") {
+  console.log(sarifReport(displayRoot, r));
 } else {
   printReport(displayRoot, r, opts);
 }

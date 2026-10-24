@@ -117,6 +117,12 @@ let code = 0;
 try { execFileSync("node", [bin, tmp, "--strict"], { encoding: "utf8" }); } catch (e) { code = e.status; }
 ok(code === 1, "--strict exits 1 on findings");
 
+// --format github and --format=sarif
+const ghOut = execFileSync("node", [bin, tmp, "--format", "github"], { encoding: "utf8" });
+ok(ghOut.includes("::error file=") && ghOut.includes("::warning file="), "--format github emits workflow annotations");
+const sarifOut = JSON.parse(execFileSync("node", [bin, tmp, "--format=sarif"], { encoding: "utf8" }));
+ok(sarifOut.version === "2.1.0" && sarifOut.runs?.[0]?.results?.length === r.findings.length, "--format=sarif emits valid SARIF 2.1.0");
+
 fs.rmSync(tmp, { recursive: true, force: true });
 fs.rmSync(clean, { recursive: true, force: true });
 console.log(fails ? `\n${fails} check(s) failed` : "\nall checks passed");
