@@ -1,8 +1,12 @@
 # ruleherd
 
+[![npm](https://img.shields.io/npm/v/ruleherd)](https://www.npmjs.com/package/ruleherd)
+[![ci](https://github.com/princejain756/ruleherd/actions/workflows/ci.yml/badge.svg)](https://github.com/princejain756/ruleherd/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 **`npx ruleherd` audits the agent instruction files you already have: contradictions, dead references, and copy-pasted rules that drifted apart.**
 
-![ruleherd auditing real config files](demo.png)
+![ruleherd auditing real config files](demo.gif)
 
 Every agent tool wants its own config file. `CLAUDE.md`, `AGENTS.md`, `.cursor/rules/`, `.windsurfrules`, `.github/copilot-instructions.md`, `GEMINI.md`. You write the rule once, paste it into five places, and six months later they disagree. ruleherd reads whatever is already on disk and tells you where the files stopped matching, instead of asking you to adopt yet another format.
 
